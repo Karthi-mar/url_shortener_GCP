@@ -15,7 +15,7 @@ each phase**, plus practical "how to run this right now" instructions.
 | 1 | Flask app, in-memory dict | ✅ Done |
 | 2 | Swap in Firestore | ✅ Done |
 | 3 | Dockerize | ✅ Done |
-| 4 | Terraform: Artifact Registry + IAM | ⬜ Not started |
+| 4 | Terraform: Artifact Registry + IAM | ✅ Done |
 | 5 | Terraform: Cloud Run + Firestore | ⬜ Not started |
 | 6 | GitHub Actions CI | ⬜ Not started |
 | 7 | GitHub Actions CD | ⬜ Not started |
@@ -224,11 +224,61 @@ root); all 5 endpoints behave identically to the non-containerized version, test
 against real Firestore; final image is `python:3.12-slim` base + ~63MB of app
 layers.
 
+### Phase 4 — Terraform: Artifact Registry + service account + IAM
+First Terraform phase. Local state (no remote/GCS backend) — deliberate
+simplicity choice for a solo project; state files are gitignored
+(`*.tfstate`), but `.terraform.lock.hcl` **is** committed (it pins exact
+provider versions/checksums for reproducibility, unlike the downloaded
+provider binaries in `.terraform/`, which aren't).
+
+**Resources created (`terraform/`):**
+- `google_project_service` × 2 — declaratively enables `artifactregistry.googleapis.com`
+  and `iam.googleapis.com`, instead of a manual `gcloud services enable` step.
+- `google_artifact_registry_repository` (`url-shortener`, `us-central1`, DOCKER
+  format) — with a cleanup policy active from creation (`cleanup_policy_dry_run
+  = false`), not bolted on later:
+  ```hcl
+  cleanup_policies {
+    id     = "delete-old-versions"
+    action = "DELETE"
+    condition { tag_state = "ANY" }
+  }
+  cleanup_policies {
+    id     = "keep-latest-n"
+    action = "KEEP"
+    most_recent_versions { keep_count = var.image_keep_count }  # 3
+  }
+  ```
+  `KEEP` policies take priority over `DELETE` when both match a version — net
+  effect: keep the last 3 image pushes, auto-delete everything older, directly
+  enforcing the 0.5GB Artifact Registry free-tier cap from CLAUDE.md.
+- `google_service_account` (`url-shortener-run-sa`) — a dedicated **runtime**
+  identity for the future Cloud Run service (Phase 5). Deliberately separate
+  from any future CI/CD deployer identity (Phase 7, via Workload Identity
+  Federation) — the running container shouldn't have permission to deploy new
+  revisions or push images, only to do its actual job.
+- `google_project_iam_member` — grants that service account exactly one role,
+  `roles/datastore.user` (Firestore Native mode's standard read/write role;
+  Firestore has no finer-grained IAM than project level). Used `_iam_member`
+  specifically (not `_iam_binding` or a full policy resource) so this only ever
+  touches this one grant, without fighting over ownership of the whole role's
+  member list.
+
+**Deliberately not granted:** Artifact Registry or logging roles on the runtime
+SA. Cloud Run pulls images via its own Google-managed service agent (not the
+runtime SA), and this app's stdout/stderr logging is captured by the Cloud Run
+platform itself — neither needs the runtime SA to call those APIs directly.
+
+**Verified:** `terraform plan` showed exactly 5 resources to add, 0 changed, 0
+destroyed, reviewed line-by-line before applying. Post-`apply`, cross-checked
+against live GCP state (not just Terraform's own report) via `gcloud artifacts
+repositories describe`, `gcloud iam service-accounts describe`, and `gcloud
+projects get-iam-policy` — all three match the Terraform config exactly.
+
 ---
 
 ## Roadmap (remaining phases)
 Full detail in [CLAUDE.md](CLAUDE.md).
-- **Phase 4** — Terraform: Artifact Registry (with cleanup policy for the 0.5GB free cap) + service account + least-privilege IAM
 - **Phase 5** — Terraform: Cloud Run service (`min-instances=0`) + Firestore database resource
 - **Phase 6** — GitHub Actions CI (lint + test on PR)
 - **Phase 7** — GitHub Actions CD (build, push, deploy on merge to `main`)
