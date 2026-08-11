@@ -1,10 +1,10 @@
 import pytest
 
-from main import app, urls_collection
+from main import app, get_urls_collection
 
 
 def _delete_all_urls():
-    for doc in urls_collection.stream():
+    for doc in get_urls_collection().stream():
         doc.reference.delete()
 
 

@@ -1,0 +1,9 @@
+.git
+.github
+Terraform/
+README.md
+app/tests/
+app/requirements-dev.txt
+**/__pycache__/
+**/*.pyc
+.venv/

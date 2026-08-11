@@ -1,3 +1,4 @@
+import os
 import random
 import string
 
@@ -6,16 +7,24 @@ from google.cloud import firestore
 
 app = Flask(__name__)
 
-GCP_PROJECT_ID = "karthi-url-shortener-2026"
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID","karthi-url-shortener-2026") # for different environments (like test , dev ,prod so there is no need to change manually)
+#GCP_PROJECT_ID = "karthi-url-shortener-2026"
 
-db = firestore.Client(project=GCP_PROJECT_ID)
-urls_collection = db.collection("urls")
+_db_client = None
+#db = firestore.Client(project=GCP_PROJECT_ID)
+#urls_collection = db.collection("urls")
 
 CODE_LENGTH = 6
 CODE_CHARS = string.ascii_letters + string.digits
 
+def get_urls_collection():
+    global _db_client
+    if _db_client is None:
+        _db_client = firestore.Client(project=GCP_PROJECT_ID)
+    return _db_client.collection("urls")
 
-def generate_short_code():
+
+def generate_short_code(urls_collection):
     while True:
         code = "".join(random.choices(CODE_CHARS, k=CODE_LENGTH))
         if not urls_collection.document(code).get().exists:
@@ -39,7 +48,8 @@ def shorten_url():
     if not is_valid_url(original_url):
         return jsonify(error="Provide a valid URL"), 400
 
-    short_code = generate_short_code()
+    urls_collection = get_urls_collection()
+    short_code = generate_short_code(urls_collection)
     urls_collection.document(short_code).set({"original_url": original_url})
 
     return jsonify(
@@ -51,6 +61,7 @@ def shorten_url():
 
 @app.route("/urls", methods=["GET"])
 def url_list():
+    urls_collection = get_urls_collection()
     return jsonify(
         [
             {"short_code": doc.id, "original_url": doc.to_dict()["original_url"]}
@@ -61,6 +72,7 @@ def url_list():
 
 @app.route("/<short_code>", methods=["GET"])
 def redirect_to_url(short_code):
+    urls_collection = get_urls_collection()
     doc = urls_collection.document(short_code).get()
     if not doc.exists:
         return jsonify(error="Short code not found"), 404
@@ -69,6 +81,7 @@ def redirect_to_url(short_code):
 
 @app.route("/<short_code>", methods=["DELETE"])
 def delete_url(short_code):
+    urls_collection = get_urls_collection()
     doc_ref = urls_collection.document(short_code)
     if not doc_ref.get().exists:
         return jsonify(error="Please enter a valid short_code"), 404

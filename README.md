@@ -14,7 +14,7 @@ each phase**, plus practical "how to run this right now" instructions.
 |---|---|---|
 | 1 | Flask app, in-memory dict | ✅ Done |
 | 2 | Swap in Firestore | ✅ Done |
-| 3 | Dockerize | ⬜ Not started |
+| 3 | Dockerize | ✅ Done |
 | 4 | Terraform: Artifact Registry + IAM | ⬜ Not started |
 | 5 | Terraform: Cloud Run + Firestore | ⬜ Not started |
 | 6 | GitHub Actions CI | ⬜ Not started |
@@ -164,10 +164,65 @@ explicitly calls `DELETE`, and the pytest `clear_store` fixture wipes the whole
 tests is the expected, correct end-state — not a bug. To see a document persist, run
 a manual `POST /shorten` and skip the delete step (see Quick Start above).
 
-### Phase 3 — Dockerize (not started)
-Planned: multi-stage Docker build (builder stage installs deps, runtime stage copies
-only what's needed), `python:3.13-slim` base, non-root user, gunicorn replacing
-Flask's dev server, listening on Cloud Run's injected `$PORT`. Will be filled in once built.
+### Phase 3 — Dockerize
+Multi-stage build: a `builder` stage installs Python dependencies (`pip install
+--user`), and a separate minimal runtime stage copies only the installed packages
+and `main.py` from it — no compilers or pip caches end up in the final image. Base
+image is `python:3.12-slim`. The container runs as a dedicated `appuser` (created
+via `useradd --create-home`), not root. Flask's dev server is replaced by
+**gunicorn** as the actual production process.
+
+**A real gunicorn/Firestore gotcha, and the fix already in place:** `main.py`
+creates its Firestore client **lazily** — on first request, via a
+`get_urls_collection()` helper backed by a module-level `_db_client` cache — instead
+of eagerly at import time. Reason: gunicorn's master process imports `main.py` once,
+then *forks* worker processes from it (`CMD ... --workers 2 --threads 4`). gRPC
+clients (used internally by the Firestore client library) aren't fork-safe — a
+client created in the master *before* the fork can hang or crash inside the forked
+workers. Creating it lazily means each worker creates its own client only after
+it's already running as its own process, sidestepping the issue entirely.
+
+**Dockerfile mechanics worth knowing:**
+- `COPY --from=builder /root/.local /home/appuser/.local` — copies only the
+  installed pip packages from the builder stage, not the build-time cruft.
+- `ENV PATH=/home/appuser/.local/bin:$PATH` — pip installed with `--user` puts
+  scripts (including `gunicorn` itself) under `~/.local/bin`, which isn't on `PATH`
+  by default; this makes `gunicorn` resolvable in the final `CMD`.
+- `ENV PORT=8080` is a *default* — Cloud Run injects its own `PORT` at container
+  runtime, which overrides this; it just means `docker run` works locally without
+  passing `-e PORT=8080` manually.
+- `CMD exec gunicorn --bind 0.0.0.0:$PORT ...` uses **shell form** (not the
+  JSON-array form Docker's linter suggests) deliberately — shell form is required
+  for `$PORT` to actually get expanded at container startup. The `exec` at the
+  front avoids the usual downside of shell-form `CMD` (an intermediate shell
+  process swallowing OS signals): `exec` replaces the shell process with gunicorn
+  directly, so Cloud Run's shutdown `SIGTERM` reaches gunicorn correctly.
+- One instruction-syntax gotcha hit while fixing this: Dockerfiles don't support
+  trailing `# comment`s on most instructions the way shell scripts do — only `RUN`
+  (whose entire line is handed to a real shell) honors them. On `COPY`/`ENV`/etc.,
+  a trailing `#comment` gets parsed as extra literal arguments instead of being
+  ignored, breaking the instruction. Fix: put the comment on its own line above.
+
+**Local testing nuance:** the container has no gcloud config baked in, so it can't
+use Application Default Credentials the way the host machine does. For local
+`docker run` testing only, the host's ADC file gets mounted in and pointed to via
+an env var:
+```powershell
+docker run -d -p 8080:8080 `
+  -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json `
+  -v "$env:APPDATA\gcloud\application_default_credentials.json:/tmp/adc.json:ro" `
+  url-shortener:phase3
+```
+(Note: this must be run from PowerShell, not Git Bash — Git Bash's MSYS runtime
+auto-translates `/tmp/adc.json`-style arguments into Windows host paths before
+Docker ever sees them, silently corrupting the mount.) Real deployment (Phase 5)
+uses the Cloud Run service's attached service account instead — no ADC or mounted
+credentials involved at all in production, this is a local-testing-only workaround.
+
+**Verified:** `docker build` succeeds; container runs as `appuser` (uid 1000, not
+root); all 5 endpoints behave identically to the non-containerized version, tested
+against real Firestore; final image is `python:3.12-slim` base + ~63MB of app
+layers.
 
 ---
 
